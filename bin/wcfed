@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# Thin launcher so the package runs straight from a clone, with no install step
+# and no PYTHONPATH for the caller to remember. Does not cd, so relative paths
+# in arguments still mean what the caller meant.
+set -euo pipefail
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="$(dirname "$HERE")"
+exec env PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" python3 -m wcfed.cli "$@"

@@ -1,0 +1,70 @@
+#!/usr/bin/env bash
+# fedcast --to <handle@org> [--conv <id>] [--depth <n>] [--post] <message...>
+#
+# The cross-org counterpart to watercooler's `broadcast`. Same idea, one extra
+# hop: it POSTs to the local gateway, which signs the message and hands it to
+# the relay.
+#
+#   fedcast --to docs@zamua "the spec is at ..."           # ping: interrupts them
+#   fedcast --to docs@zamua --post "build is green"        # ambient: wakes nobody
+#   fedcast --to docs@zamua --conv 4f2a "done, thanks"     # reply, ENDS the thread
+#
+# Sender identity is this session's tmux window name, exactly as broadcast
+# resolves it — the -t "$TMUX_PANE" matters, or tmux answers for whichever
+# window happens to be focused.
+set -uo pipefail
+
+GW="${WCFED_GATEWAY_URL:-http://127.0.0.1:8799}"
+TO="" CONV="" DEPTH=0 KIND="ping"
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --to)    TO="${2:-}"; shift 2 ;;
+    --conv)  CONV="${2:-}"; shift 2 ;;
+    --depth) DEPTH="${2:-0}"; shift 2 ;;
+    --post)  KIND="post"; shift ;;
+    --ping)  KIND="ping"; shift ;;
+    -h|--help)
+      sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'
+      exit 0 ;;
+    --) shift; break ;;
+    *) break ;;
+  esac
+done
+
+MSG="$*"
+if [ -z "$TO" ] || [ -z "$MSG" ]; then
+  echo "usage: fedcast --to <handle@org> [--conv <id>] [--post] <message>" >&2
+  exit 1
+fi
+
+SENDER="$(tmux display-message -p -t "${TMUX_PANE:-}" '#{window_name}' 2>/dev/null || echo agent)"
+
+BODY="$(TO="$TO" MSG="$MSG" KIND="$KIND" CONV="$CONV" DEPTH="$DEPTH" SENDER="$SENDER" \
+  python3 -c '
+import json, os
+p = {"to": os.environ["TO"], "text": os.environ["MSG"], "kind": os.environ["KIND"],
+     "depth": int(os.environ["DEPTH"] or 0), "from": os.environ["SENDER"]}
+if os.environ.get("CONV"):
+    p["conv"] = os.environ["CONV"]
+print(json.dumps(p))')"
+
+RESP="$(curl -s --max-time 45 -X POST "$GW/outbound" \
+  -H 'Content-Type: application/json' --data "$BODY")"
+
+if [ -z "$RESP" ]; then
+  echo "fedcast: no response from gateway at $GW — is 'wcfed gateway' running?" >&2
+  exit 2
+fi
+
+case "$RESP" in
+  *'"ok": true'*|*'"ok":true'*)
+    RCONV="$(printf '%s' "$RESP" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("conv",""))' 2>/dev/null)"
+    echo "fedcast sent to $TO as [$SENDER]"
+    [ -n "$RCONV" ] && echo "reply with: fedcast --to $TO --conv $RCONV \"...\""
+    ;;
+  *)
+    echo "fedcast FAILED: $RESP" >&2
+    exit 3
+    ;;
+esac

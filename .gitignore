@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+*.egg-info/
+.venv/
+
+# Key material and local state. A shared secret in a git history is a shared
+# secret forever, even after the file is deleted.
+*.env
+!examples/*.env.example
+.wcfed/
+state/
+inbox*.jsonl
+feed-*.log
+seen-*.txt
+credentials.txt
