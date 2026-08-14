@@ -14,6 +14,7 @@ from .config import Config
 from .envelope import EnvelopeError, build, canonical, parse_address, verify
 from .gateway import Gateway
 from .relay import parse_tokens, serve
+from .transport import make_transport
 
 
 def _cfg(args) -> Config:
@@ -85,10 +86,13 @@ def cmd_doctor(args) -> int:
         print(f"  [FAIL] config — {exc}")
         return 1
 
-    print(f"config: org={cfg.org} sink={cfg.sink} relay={cfg.relay_url}")
+    print(f"config: org={cfg.org} transport={cfg.transport} sink={cfg.sink}")
     check("org id is valid", True)
     check("at least one peer secret", bool(cfg.peers), f"peers: {sorted(cfg.peers) or 'none'}")
-    check("relay token set", bool(cfg.relay_token))
+    # Relay credentials only exist for the http transport; demanding them under
+    # github reports a failure for a setting that has no meaning there.
+    if cfg.transport == "http":
+        check("relay token set", bool(cfg.relay_token))
     check(
         "allowlist is not empty",
         bool(cfg.allowed_orgs),
@@ -111,34 +115,39 @@ def cmd_doctor(args) -> int:
             canonical(env) == canonical(json.loads(json.dumps(env))),
         )
 
-    # Relay reachability
+    # Transport reachability
+    print(f"\ntransport: {cfg.transport}")
+    if cfg.transport == "github":
+        check("repo configured", "/" in cfg.github_repo, cfg.github_repo or "unset")
+        check("issue number set", cfg.github_issue > 0, f"#{cfg.github_issue}")
+        check("token present", bool(cfg.github_token))
     try:
-        with urllib.request.urlopen(f"{cfg.relay_url}/v1/health", timeout=15) as resp:
-            health = json.loads(resp.read().decode("utf-8"))
-        check("relay reachable", True, f"orgs known: {', '.join(health.get('orgs', []))}")
-        check(
-            "relay knows our org",
-            cfg.org in health.get("orgs", []),
-            f"we are {cfg.org!r}",
-        )
-        for peer in cfg.peers:
-            check(f"relay knows peer {peer}", peer in health.get("orgs", []))
+        transport = make_transport(cfg)
+        health = transport.health()
+        if cfg.transport == "github":
+            check(
+                "bus issue reachable",
+                bool(health.get("ok")),
+                f"{health.get('repo')}#{health.get('issue')} "
+                f"\"{health.get('title')}\" ({health.get('comments')} comments)",
+            )
+            check(
+                "bus issue is open",
+                health.get("state") == "open",
+                f"state={health.get('state')} — a closed issue still accepts comments, "
+                "but reopen it to keep the thread obvious",
+            )
+        else:
+            check("relay reachable", True, f"orgs known: {', '.join(health.get('orgs', []))}")
+            check("relay knows our org", cfg.org in health.get("orgs", []), f"we are {cfg.org!r}")
+            for peer in cfg.peers:
+                check(f"relay knows peer {peer}", peer in health.get("orgs", []))
+        # A read that returns without raising proves the credential works. It is
+        # the same call the gateway makes, so a pass here means a pass in anger.
+        transport.poll(0)
+        check("credential accepted for reads", True)
     except Exception as exc:
-        check("relay reachable", False, str(exc))
-
-    # Relay auth: an unauthenticated poll must be refused, ours must not be.
-    try:
-        req = urllib.request.Request(
-            f"{cfg.relay_url}/v1/poll?wait=0",
-            headers={"X-Wcfed-Org": cfg.org, "X-Wcfed-Auth": cfg.relay_token},
-        )
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            json.loads(resp.read().decode("utf-8"))
-        check("relay accepts our token", True)
-    except urllib.error.HTTPError as exc:
-        check("relay accepts our token", False, f"HTTP {exc.code} — token wrong for this org?")
-    except Exception as exc:
-        check("relay accepts our token", False, str(exc))
+        check(f"{cfg.transport} transport reachable", False, str(exc))
 
     print("\n" + ("all checks passed" if ok else "SOME CHECKS FAILED"))
     return 0 if ok else 1

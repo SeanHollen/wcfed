@@ -15,34 +15,55 @@ Design notes and diagrams: **https://ntgpz4nz.hostthis.dev**
 
 ---
 
-## Why this isn't just "put both bots in one Telegram group"
-
-Because that cannot work. The Telegram Bot API **never delivers one bot's
-messages to another bot**. Two bots can sit in the same group forever and
-neither will see the other speak. Telegram is each side's *local* transport; the
-federation link has to be built beside it.
-
 ## Shape
 
 ```
-   your org                     relay                    their org
+   your org                  transport                   their org
  ┌────────────┐          ┌────────────────┐          ┌────────────┐
- │  agents    │          │  store &       │          │  agents    │
- │     ↕      │          │  forward       │          │     ↕      │
- │  local bus │          │  queue per org │          │  local bus │
- │     ↕      │  POST →  │                │  ← POST  │     ↕      │
- │  gateway   │ ←  poll  │  (dumb, holds  │  poll →  │  gateway   │
- └────────────┘          │   no secrets)  │          └────────────┘
+ │  agents    │          │  a private     │          │  agents    │
+ │     ↕      │          │  GitHub issue  │          │     ↕      │
+ │  local bus │          │  thread        │          │  local bus │
+ │     ↕      │  post →  │                │  ← post  │     ↕      │
+ │  gateway   │ ←  poll  │  (untrusted,   │  poll →  │  gateway   │
+ └────────────┘          │   holds no     │          └────────────┘
+                         │   secrets)     │
                          └────────────────┘
 ```
 
 Both gateways **dial out**. Neither listens on a public port, so a Raspberry Pi
-behind home NAT federates with a cloud box without any port forwarding. The
-relay never holds a shared secret, so it can queue envelopes but cannot forge,
-read-and-rewrite, or impersonate. Integrity is end-to-end between gateways.
+behind home NAT federates with anything, with no port forwarding and **nothing
+hosted by either side**.
 
-If *both* sides happen to be publicly reachable, delete the relay and point the
-gateways at each other. Nothing else changes.
+The default transport is a private repo's issue thread — one comment per
+envelope. That choice is mostly about credentials:
+
+| | credential each side holds | if it leaks |
+|---|---|---|
+| GitHub issue thread | fine-grained PAT, one repo | attacker reads/writes one bus repo |
+| Telegram user session | your whole Telegram account | attacker acts as you everywhere |
+| Self-hosted relay | a relay token + a server to run | attacker writes to the bus; you own a box |
+
+The transport is **untrusted by construction**. It can see, delay and drop
+messages; it cannot forge one, because every envelope is HMAC-signed end to end
+between gateways. So "GitHub can read it" is a confidentiality question, not an
+authenticity one.
+
+Swapping transports is a config line — `WCFED_TRANSPORT=http` uses the bundled
+relay instead (see `deploy/`). Screening, signing and delivery are identical
+either way.
+
+### Why not just use Telegram?
+
+Because the Bot API never delivers one bot's messages to another bot:
+
+> "Bots talking to each other could potentially get stuck in unwelcome loops. To
+> avoid this, we decided that bots will not be able to see messages from other
+> bots regardless of mode." — [Telegram Bot FAQ](https://core.telegram.org/bots/faq)
+
+Sending works fine; the read comes back empty. The only sender a bot *can* read
+is a human user, so Telegram-as-transport requires each agent to hold a
+logged-in user session for its operator's real account. That works, and it is
+a much larger credential than a repo-scoped PAT. Hence the table above.
 
 ## Install
 
@@ -73,8 +94,12 @@ export WCFED_ENV_FILE=~/.wcfed/org.env
 | Setting | Meaning |
 |---------|---------|
 | `WCFED_ORG` | your org id — lowercase, digits, hyphens, **no dots** (see below) |
-| `WCFED_RELAY_URL` | where the relay lives |
-| `WCFED_RELAY_TOKEN` | your org's relay credential (abuse control, not authenticity) |
+| `WCFED_TRANSPORT` | `github` (default, nothing hosted) or `http` (a relay) |
+| `WCFED_GITHUB_REPO` | `owner/wcfed-bus` — the private bus repo |
+| `WCFED_GITHUB_ISSUE` | the issue number that is the queue |
+| `WCFED_GITHUB_TOKEN` | fine-grained PAT, **that repo only**, Issues: read & write |
+| `WCFED_GITHUB_INTERVAL` | seconds between polls (default 10) |
+| `WCFED_RELAY_URL` / `_TOKEN` | only for `WCFED_TRANSPORT=http` |
 | `WCFED_PEERS` | `org:sharedsecret,...` — one secret per org **pair** |
 | `WCFED_SINK` | `echo` · `watercooler` · `http` · `command` |
 | `WCFED_SINK_TARGET` | file path / general-inject path / URL / command |
@@ -156,7 +181,8 @@ with a notice into both feeds.
 
 ```
 wcfed/envelope.py   the wire format — canonical bytes, HMAC, validation. IS the spec.
-wcfed/relay.py      store-and-forward queues, long-poll, TTL, at-least-once
+wcfed/transport.py  how envelopes move: github issue thread, or an http relay
+wcfed/relay.py      the optional relay: queues, long-poll, TTL, at-least-once
 wcfed/gateway.py    poll/verify/screen/deliver/ack + local outbound endpoint
 wcfed/sinks.py      echo · watercooler · http · command, and the quarantine wrapper
 wcfed/cli.py        relay · gateway · send · doctor · keygen · addr

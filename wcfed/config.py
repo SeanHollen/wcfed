@@ -56,9 +56,20 @@ def _parse_peers(spec: str) -> dict[str, str]:
 @dataclass
 class Config:
     org: str
-    relay_url: str
-    relay_token: str
     peers: dict[str, str] = field(default_factory=dict)
+
+    # How envelopes move between gateways. `github` needs nothing hosted:
+    # a private repo's issue thread is the queue, and a fine-grained PAT
+    # scoped to that one repo is the whole credential.
+    transport: str = "github"
+
+    relay_url: str = ""
+    relay_token: str = ""
+
+    github_repo: str = ""
+    github_issue: int = 0
+    github_token: str = ""
+    github_interval: int = 10
 
     # Safety envelope. These are the knobs the plan's phase 4 is about; they
     # ship on by default because a limit you have to remember to turn on is
@@ -106,10 +117,28 @@ class Config:
         listen = get("LISTEN", "127.0.0.1:8799")
         host, _, port = listen.rpartition(":")
 
+        transport = get("TRANSPORT", "github")
+        gh_token = get("GITHUB_TOKEN")
+        # A token on disk in the config beats a token in the environment of every
+        # process the gateway spawns, but reading GH_TOKEN/GITHUB_TOKEN as a
+        # fallback saves a duplicated secret for anyone who already has one.
+        if not gh_token:
+            gh_token = (os.environ.get("WCFED_GH_TOKEN") or "").strip()
+        gh_token_file = get("GITHUB_TOKEN_FILE")
+        if not gh_token and gh_token_file:
+            path = Path(gh_token_file).expanduser()
+            if path.exists():
+                gh_token = path.read_text().strip()
+
         return cls(
             org=org,
+            transport=transport,
             relay_url=get("RELAY_URL", "http://127.0.0.1:8787").rstrip("/"),
             relay_token=get("RELAY_TOKEN"),
+            github_repo=get("GITHUB_REPO"),
+            github_issue=int(get("GITHUB_ISSUE", "0") or 0),
+            github_token=gh_token,
+            github_interval=int(get("GITHUB_INTERVAL", "10")),
             peers=peers,
             depth_max=int(get("DEPTH_MAX", "8")),
             rate_per_min=int(get("RATE_PER_MIN", "30")),

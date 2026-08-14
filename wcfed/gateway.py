@@ -16,9 +16,6 @@ from __future__ import annotations
 import json
 import threading
 import time
-import urllib.error
-import urllib.parse
-import urllib.request
 from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -26,6 +23,7 @@ from pathlib import Path
 from .config import Config
 from .envelope import EnvelopeError, addr, build, parse_address, validate, verify
 from .sinks import make_sink, quarantine
+from .transport import TransportError, make_transport
 
 
 class Rejected(Exception):
@@ -97,29 +95,13 @@ class Gateway:
     def __init__(self, cfg: Config):
         self.cfg = cfg
         self.sink = make_sink(cfg.sink, cfg.sink_target)
+        self.transport = make_transport(cfg)
         cfg.state_dir.mkdir(parents=True, exist_ok=True)
         self.seen = SeenIds(cfg.state_dir / f"seen-{cfg.org}.txt")
         self.rate = RateLimiter(cfg.rate_per_min)
         self.feed = cfg.state_dir / f"feed-{cfg.org}.log"
         self._stop = threading.Event()
         self.stats = {"sent": 0, "received": 0, "rejected": 0, "delivered": 0}
-
-    # -- relay plumbing --------------------------------------------------
-    def _relay(self, path: str, payload: dict | None, method: str = "POST", timeout: float = 40):
-        url = f"{self.cfg.relay_url}{path}"
-        data = json.dumps(payload).encode("utf-8") if payload is not None else None
-        req = urllib.request.Request(
-            url,
-            data=data,
-            method=method,
-            headers={
-                "Content-Type": "application/json",
-                "X-Wcfed-Org": self.cfg.org,
-                "X-Wcfed-Auth": self.cfg.relay_token,
-            },
-        )
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return json.loads(resp.read().decode("utf-8"))
 
     # -- outbound --------------------------------------------------------
     def send(
@@ -151,7 +133,7 @@ class Gateway:
             depth=depth,
             secret=secret,
         )
-        resp = self._relay("/v1/send", env)
+        resp = self.transport.send(env)
         self.stats["sent"] += 1
         self._append_feed("->", env)
         log(self.cfg, f"sent {env['id']} -> {to} ({kind}, #{env['conv']} d{env['depth']})")
@@ -231,14 +213,8 @@ class Gateway:
         backoff = 1.0
         while not self._stop.is_set():
             try:
-                resp = self._relay(
-                    f"/v1/poll?wait={self.cfg.poll_wait}",
-                    None,
-                    method="GET",
-                    timeout=self.cfg.poll_wait + 15,
-                )
+                msgs = self.transport.poll(self.cfg.poll_wait)
                 backoff = 1.0
-                msgs = resp.get("messages") or []
                 if msgs:
                     self.stats["received"] += len(msgs)
                     for env in msgs:
@@ -247,11 +223,11 @@ class Gateway:
                     # should redeliver, and dedupe makes that cheap.
                     ids = [m.get("id") for m in msgs if m.get("id")]
                     try:
-                        self._relay("/v1/ack", {"ids": ids})
+                        self.transport.ack(ids)
                     except Exception as exc:
                         log(self.cfg, f"ack failed (will redeliver): {exc}")
-            except urllib.error.HTTPError as exc:
-                log(self.cfg, f"poll HTTP {exc.code}: {exc.read()[:200]!r}")
+            except TransportError as exc:
+                log(self.cfg, f"poll failed: {exc}")
                 self._stop.wait(min(backoff, 30))
                 backoff = min(backoff * 2, 30)
             except Exception as exc:
@@ -346,6 +322,7 @@ class Gateway:
                         {
                             "ok": True,
                             "org": gw.cfg.org,
+                            "transport": gw.cfg.transport,
                             "sink": gw.cfg.sink,
                             "peers": sorted(gw.cfg.peers),
                             "allowed_orgs": sorted(gw.cfg.allowed_orgs),
@@ -387,7 +364,8 @@ class Gateway:
     # -- lifecycle -------------------------------------------------------
     def run(self) -> None:
         cfg = self.cfg
-        log(cfg, f"gateway up · sink={cfg.sink} · relay={cfg.relay_url}")
+        where = cfg.relay_url if cfg.transport == "http" else f"{cfg.github_repo}#{cfg.github_issue}"
+        log(cfg, f"gateway up · transport={cfg.transport} · sink={cfg.sink} · via {where}")
         log(cfg, f"peers={sorted(cfg.peers)} depth_max={cfg.depth_max} rate={cfg.rate_per_min}/min")
 
         httpd = self.serve_local()

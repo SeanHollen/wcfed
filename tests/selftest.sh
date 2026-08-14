@@ -106,6 +106,39 @@ sys.exit(1 if fails else 0)
 PY
 if [ $? -eq 0 ]; then ok "envelope unit checks"; else bad "envelope unit checks"; fi
 
+# --------------------------------------------------- transport pure functions
+head_ "1b. transport: cursor arithmetic under a non-UTC timezone"
+# Forced to a non-UTC zone deliberately. time.mktime() would pass here under
+# TZ=UTC and silently shift the cursor by the local offset anywhere else --
+# inbound stops arriving while sending keeps working, which is a miserable
+# thing to debug in the field.
+TZ="America/New_York" env PYTHONPATH="$ROOT" python3 - <<'PY'
+import sys, time
+from wcfed.transport import _minus_one_second
+
+fails = []
+def check(label, cond):
+    print(("  PASS " if cond else "  FAIL ") + label)
+    if not cond: fails.append(label)
+
+check("local offset is non-zero (test is meaningful)", time.timezone != 0 or time.daylight)
+cases = [
+    ("2026-08-14T01:01:18Z", "2026-08-14T01:01:17Z"),
+    ("2026-08-14T00:00:00Z", "2026-08-13T23:59:59Z"),   # midnight rollover
+    ("2026-01-01T00:00:00Z", "2025-12-31T23:59:59Z"),   # year rollover
+]
+for given, want in cases:
+    got = _minus_one_second(given)
+    check(f"{given} -> {want}", got == want)
+    if got != want:
+        print(f"       got {got} (drifted {want[11:]} vs {got[11:]})")
+
+check("garbage passes through unchanged", _minus_one_second("not-a-date") == "not-a-date")
+sys.exit(1 if fails else 0)
+PY
+if [ $? -eq 0 ]; then ok "cursor arithmetic is timezone-independent"; else
+  bad "cursor arithmetic is timezone-independent"; fi
+
 # ---------------------------------------------------------------- relay
 head_ "2. relay + two gateways"
 env PYTHONPATH="$ROOT" python3 -m wcfed.cli relay --host 127.0.0.1 --port "$RELAY_PORT" \
@@ -118,6 +151,7 @@ fi
 mk_env() {  # org, port, sink_target
   cat >"$TMP/$1.env" <<EOF
 WCFED_ORG=$1
+WCFED_TRANSPORT=http
 WCFED_RELAY_URL=http://127.0.0.1:$RELAY_PORT
 WCFED_RELAY_TOKEN=$2
 WCFED_PEERS=$3:$SECRET

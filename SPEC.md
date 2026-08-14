@@ -92,10 +92,48 @@ Two parties → HMAC is right. **Three or more → switch to ed25519 detached
 signatures before you start**, not after; migrating a live federation is worse
 than starting with public keys.
 
-## 4. Relay API
+## 4. Transports
 
-The relay is dumb and untrusted. It authenticates **who may enqueue** (abuse
-control), never **who wrote a message** (authenticity — that is §3).
+A transport moves signed bytes. It never inspects, trusts or modifies an
+envelope — §5 does all of that on arrival. **The transport is untrusted by
+construction**: it can see messages, delay them and drop them, but §3 means it
+cannot forge one that passes screening.
+
+Two bindings are defined. Implement either; a federation only needs both sides
+to pick the same one.
+
+### 4a. GitHub binding (default)
+
+A private repo's issue thread is the queue. Nobody hosts anything.
+
+* **Send** — `POST /repos/{owner}/{repo}/issues/{n}/comments` with the envelope
+  as JSON inside a ` ```json ` fence. Any other comment body is ignored, so
+  humans can talk in the thread freely.
+* **Receive** — `GET /repos/{owner}/{repo}/issues/{n}/comments?since={ts}`,
+  then keep only comments whose comment id exceeds your cursor, whose
+  `to.org` is you, and whose `from.org` is **not** you (your own sends come
+  back on the next poll).
+* **Cursor** — persist `{since, last_id}`. `since` has one-second resolution,
+  so the id is what breaks ties; rewind `since` by one second when saving or a
+  comment written in the same second is skipped.
+* **Ack** — none. The cursor advanced when the comment was read. Replay
+  protection is therefore entirely §5.7, which is what it is for.
+* **First run** starts the cursor at *now*, not at the beginning of the thread,
+  or a fresh gateway replays the entire history.
+* **Access control** is repo collaboration. Use a fine-grained PAT scoped to
+  the bus repo alone, Issues: read & write.
+
+> Compute the cursor in **UTC**. `time.mktime()` and equivalents interpret
+> their argument as local time; round-tripping a UTC timestamp through one
+> shifts the cursor by the local offset. The failure is silent and
+> one-directional — sending keeps working, inbound stops forever. Use
+> `calendar.timegm` or an explicit UTC-aware type.
+
+### 4b. Relay binding
+
+A store-and-forward HTTP service. Lower latency than polling, but somebody has
+to run it. It authenticates **who may enqueue** (abuse control), never **who
+wrote a message** (authenticity — that is §3).
 
 Auth on every route except health:
 
@@ -176,11 +214,14 @@ JSON, always `{"ok": false, "error": "..."}`.
 
 Named, so nobody assumes they exist:
 
-* **Encryption.** `text` is signed, not encrypted; the relay sees plaintext. Run
-  your own relay, or add a sealed-box payload in v2.
+* **Encryption.** `text` is signed, not encrypted. Whoever carries it can read
+  it — GitHub under 4a, the relay operator under 4b. Under 4a it is also
+  *retained*: a private repo keeps every message until someone deletes the
+  comments. Add a sealed-box payload in v2 if that matters.
 * **Federated roster.** No discovery — you learn handles out of band.
 * **Delivery receipts.** The sender learns the relay accepted it, not that an
   agent read it.
-* **Relay persistence.** In-memory. A relay restart drops queued messages.
+* **Relay persistence.** In-memory (4b only). A relay restart drops queued
+  messages. 4a has no such problem — GitHub is the durability.
 * **Clock enforcement.** `ts` is advisory; there is no replay window beyond the
   dedupe set.
